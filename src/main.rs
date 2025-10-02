@@ -45,6 +45,14 @@ struct ComparisonStats {
     q3_second: Option<f64>,
     scored_reads_first: usize,
     scored_reads_second: usize,
+    better_perfect_to_imperfect: usize,
+    better_imperfect_to_perfect: usize,
+    better_both_perfect: usize,
+    better_both_imperfect: usize,
+    worse_perfect_to_imperfect: usize,
+    worse_imperfect_to_perfect: usize,
+    worse_both_perfect: usize,
+    worse_both_imperfect: usize,
 }
 
 fn main() {
@@ -82,6 +90,12 @@ fn main() {
                 .value_parser(clap::value_parser!(usize))
                 .help("Limit the number of reads to extract (only valid with -x)"),
         )
+        .arg(
+            Arg::new("sim0")
+                .long("sim0")
+                .action(clap::ArgAction::SetTrue)
+                .help("Track perfect CIGAR strings (e.g., '150=') and filter extraction to perfect→imperfect reads"),
+        )
         .get_matches();
 
     let file1_path = matches.get_one::<String>("file1").unwrap();
@@ -89,6 +103,7 @@ fn main() {
     let extract_fastq = matches.get_one::<String>("extract");
     let output_file = matches.get_one::<String>("output");
     let extract_limit = matches.get_one::<usize>("limit");
+    let sim0_mode = matches.get_flag("sim0");
 
     if extract_fastq.is_some() && output_file.is_none() {
         eprintln!("Error: Output file (-o) is required when using extraction (-x)");
@@ -103,6 +118,9 @@ fn main() {
     println!("Comparing SAM files:");
     println!("  Baseline: {}", file1_path);
     println!("  Comparison: {}", file2_path);
+    if sim0_mode {
+        println!("  Mode: Perfect CIGAR tracking enabled");
+    }
     if let Some(fastq_path) = extract_fastq {
         println!("  FASTQ for extraction: {}", fastq_path);
         if let Some(output_path) = output_file {
@@ -111,12 +129,15 @@ fn main() {
         if let Some(limit) = extract_limit {
             println!("  Extraction limit: {} reads", limit);
         }
+        if sim0_mode {
+            println!("  Extraction filter: Only reads going from perfect to imperfect CIGAR");
+        }
     }
     println!();
 
-    match compare_sam_files(file1_path, file2_path) {
+    match compare_sam_files(file1_path, file2_path, sim0_mode) {
         Ok(stats) => {
-            print_comparison_results(&stats);
+            print_comparison_results(&stats, sim0_mode);
 
             if let (Some(fastq_path), Some(output_path)) = (extract_fastq, output_file) {
                 println!("\n=== Extracting Reads with Worse Scores ===");
@@ -126,6 +147,7 @@ fn main() {
                     fastq_path,
                     output_path,
                     extract_limit.copied(),
+                    sim0_mode,
                 ) {
                     Ok(extracted_count) => {
                         println!(
@@ -186,6 +208,32 @@ fn is_mapped(record: &AlignmentRecord) -> bool {
     (record.flag & 0x4) == 0 && record.rname != "*"
 }
 
+fn is_perfect_cigar(cigar: &str) -> bool {
+    if cigar == "*" {
+        return false;
+    }
+
+    let trimmed = cigar.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let mut has_content = false;
+    for c in trimmed.chars() {
+        if c.is_ascii_digit() {
+            has_content = true;
+        } else if c == '=' {
+            if !has_content {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    trimmed.ends_with('=') && has_content
+}
+
 fn read_sam_file(
     file_path: &str,
 ) -> Result<HashMap<String, AlignmentRecord>, Box<dyn std::error::Error>> {
@@ -225,6 +273,7 @@ fn read_sam_file(
 fn get_worse_read_names(
     file1_path: &str,
     file2_path: &str,
+    sim0_mode: bool,
 ) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let alignments1 = read_sam_file(file1_path)?;
     let alignments2 = read_sam_file(file2_path)?;
@@ -237,7 +286,13 @@ fn get_worse_read_names(
                 let mapped2 = is_mapped(record2);
 
                 if mapped1 && !mapped2 {
-                    return Some(read_name.clone());
+                    if sim0_mode {
+                        if is_perfect_cigar(&record1.cigar) {
+                            return Some(read_name.clone());
+                        }
+                    } else {
+                        return Some(read_name.clone());
+                    }
                 }
 
                 if mapped1 && mapped2 {
@@ -245,7 +300,15 @@ fn get_worse_read_names(
                         (record1.alignment_score, record2.alignment_score)
                     {
                         if score2 < score1 {
-                            return Some(read_name.clone());
+                            if sim0_mode {
+                                let perfect1 = is_perfect_cigar(&record1.cigar);
+                                let perfect2 = is_perfect_cigar(&record2.cigar);
+                                if perfect1 && !perfect2 {
+                                    return Some(read_name.clone());
+                                }
+                            } else {
+                                return Some(read_name.clone());
+                            }
                         }
                     }
                 }
@@ -294,8 +357,9 @@ fn extract_worse_reads(
     fastq_path: &str,
     output_path: &str,
     limit: Option<usize>,
+    sim0_mode: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let worse_read_names = get_worse_read_names(file1_path, file2_path)?;
+    let worse_read_names = get_worse_read_names(file1_path, file2_path, sim0_mode)?;
 
     if worse_read_names.is_empty() {
         println!("No reads with worse scores found - creating empty output file");
@@ -346,6 +410,7 @@ fn extract_worse_reads(
 fn compare_sam_files(
     file1_path: &str,
     file2_path: &str,
+    sim0_mode: bool,
 ) -> Result<ComparisonStats, Box<dyn std::error::Error>> {
     let alignments1 = read_sam_file(file1_path)?;
     let alignments2 = read_sam_file(file2_path)?;
@@ -391,18 +456,23 @@ fn compare_sam_files(
                     match (mapped1, mapped2) {
                         (false, true) => ComparisonResult::UnmappedToMapped,
                         (true, false) => ComparisonResult::MappedToUnmapped,
-                        (true, true) => match (r1.alignment_score, r2.alignment_score) {
-                            (Some(score1), Some(score2)) => {
-                                if score2 > score1 {
-                                    ComparisonResult::BothMappedBetter
-                                } else if score2 < score1 {
-                                    ComparisonResult::BothMappedWorse
-                                } else {
-                                    ComparisonResult::BothMappedSame
+                        (true, true) => {
+                            let perfect1 = is_perfect_cigar(&r1.cigar);
+                            let perfect2 = is_perfect_cigar(&r2.cigar);
+
+                            match (r1.alignment_score, r2.alignment_score) {
+                                (Some(score1), Some(score2)) => {
+                                    if score2 > score1 {
+                                        ComparisonResult::BothMappedBetter(perfect1, perfect2)
+                                    } else if score2 < score1 {
+                                        ComparisonResult::BothMappedWorse(perfect1, perfect2)
+                                    } else {
+                                        ComparisonResult::BothMappedSame
+                                    }
                                 }
+                                _ => ComparisonResult::BothMappedSame,
                             }
-                            _ => ComparisonResult::BothMappedSame,
-                        },
+                        }
                         (false, false) => ComparisonResult::BothUnmapped,
                     }
                 }
@@ -417,8 +487,28 @@ fn compare_sam_files(
         match result {
             ComparisonResult::UnmappedToMapped => stats.unmapped_to_mapped += 1,
             ComparisonResult::MappedToUnmapped => stats.mapped_to_unmapped += 1,
-            ComparisonResult::BothMappedBetter => stats.both_mapped_better += 1,
-            ComparisonResult::BothMappedWorse => stats.both_mapped_worse += 1,
+            ComparisonResult::BothMappedBetter(perfect1, perfect2) => {
+                stats.both_mapped_better += 1;
+                if sim0_mode {
+                    match (perfect1, perfect2) {
+                        (true, false) => stats.better_perfect_to_imperfect += 1,
+                        (false, true) => stats.better_imperfect_to_perfect += 1,
+                        (true, true) => stats.better_both_perfect += 1,
+                        (false, false) => stats.better_both_imperfect += 1,
+                    }
+                }
+            }
+            ComparisonResult::BothMappedWorse(perfect1, perfect2) => {
+                stats.both_mapped_worse += 1;
+                if sim0_mode {
+                    match (perfect1, perfect2) {
+                        (true, false) => stats.worse_perfect_to_imperfect += 1,
+                        (false, true) => stats.worse_imperfect_to_perfect += 1,
+                        (true, true) => stats.worse_both_perfect += 1,
+                        (false, false) => stats.worse_both_imperfect += 1,
+                    }
+                }
+            }
             ComparisonResult::BothMappedSame => stats.both_mapped_same += 1,
             ComparisonResult::OnlyInFirst => stats.only_in_first += 1,
             ComparisonResult::OnlyInSecond => stats.only_in_second += 1,
@@ -517,15 +607,15 @@ fn calculate_quartile(sorted_scores: &[i32], quantile: f64) -> f64 {
 enum ComparisonResult {
     UnmappedToMapped,
     MappedToUnmapped,
-    BothMappedBetter,
-    BothMappedWorse,
+    BothMappedBetter(bool, bool),
+    BothMappedWorse(bool, bool),
     BothMappedSame,
     OnlyInFirst,
     OnlyInSecond,
     BothUnmapped,
 }
 
-fn print_comparison_results(stats: &ComparisonStats) {
+fn print_comparison_results(stats: &ComparisonStats, sim0_mode: bool) {
     println!("=== SAM File Comparison Results ===");
     println!();
 
@@ -637,6 +727,68 @@ fn print_comparison_results(stats: &ComparisonStats) {
         }
     );
     println!();
+
+    if sim0_mode {
+        println!("Perfect CIGAR Analysis:");
+        println!("  Improved scores breakdown:");
+        println!(
+            "    Imperfect → Perfect:  {:>8} reads ({:.1}%)",
+            stats.better_imperfect_to_perfect,
+            if stats.both_mapped_better > 0 {
+                stats.better_imperfect_to_perfect as f64 / stats.both_mapped_better as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "    Both perfect:         {:>8} reads ({:.1}%)",
+            stats.better_both_perfect,
+            if stats.both_mapped_better > 0 {
+                stats.better_both_perfect as f64 / stats.both_mapped_better as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "    Both imperfect:       {:>8} reads ({:.1}%)",
+            stats.better_both_imperfect,
+            if stats.both_mapped_better > 0 {
+                stats.better_both_imperfect as f64 / stats.both_mapped_better as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!();
+        println!("  Worse scores breakdown:");
+        println!(
+            "    Perfect → Imperfect:  {:>8} reads ({:.1}%)",
+            stats.worse_perfect_to_imperfect,
+            if stats.both_mapped_worse > 0 {
+                stats.worse_perfect_to_imperfect as f64 / stats.both_mapped_worse as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "    Both perfect:         {:>8} reads ({:.1}%)",
+            stats.worse_both_perfect,
+            if stats.both_mapped_worse > 0 {
+                stats.worse_both_perfect as f64 / stats.both_mapped_worse as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!(
+            "    Both imperfect:       {:>8} reads ({:.1}%)",
+            stats.worse_both_imperfect,
+            if stats.both_mapped_worse > 0 {
+                stats.worse_both_imperfect as f64 / stats.both_mapped_worse as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
+        println!();
+    }
 
     println!("Alignment Score Statistics:");
     println!("  Baseline file:");
